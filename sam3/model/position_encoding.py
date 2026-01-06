@@ -23,6 +23,8 @@ class PositionEmbeddingSine(nn.Module):
     ):
         super().__init__()
         assert num_pos_feats % 2 == 0, "Expecting even model width"
+        # We split the embedding dimension into two halves: one for the Y-coordinate and
+        # one for the X-coordinate. They will be concatenated later to reach the full `num_pos_feats`.
         self.num_pos_feats = num_pos_feats // 2
         self.temperature = temperature
         self.normalize = normalize
@@ -35,6 +37,8 @@ class PositionEmbeddingSine(nn.Module):
         self.cache = {}
         # Precompute positional encodings under `precompute_resolution` to fill the cache
         # and avoid symbolic shape tracing errors in torch.compile in PyTorch 2.4 nightly.
+        # This cache also serves as a performance optimization by avoiding redundant
+        # sine/cosine computations for fixed image resolutions.
         if precompute_resolution is not None:
             # We precompute pos enc for stride 4, 8, 16 and 32 to fill `self.cache`.
             precompute_sizes = [
@@ -82,6 +86,14 @@ class PositionEmbeddingSine(nn.Module):
         assert bx == by and nx == ny and bx == bl and nx == nl
         pos_x, pos_y = self._encode_xy(x.flatten(), y.flatten())
         pos_x, pos_y = pos_x.reshape(bx, nx, -1), pos_y.reshape(by, ny, -1)
+
+        # Fuse geometric information (X, Y) with semantic information (labels).
+        # We concatenate along dim=2:
+        #   pos_y: (B, N, D/2)
+        #   pos_x: (B, N, D/2)
+        #   labels[:, :, None]: (B, N, 1) --> Includes point type (positive/negative/pad)
+        # Resulting shape: (B, N, D + 1).
+        # Note: This typically requires a subsequent linear projection to map back to D.
         pos = torch.cat((pos_y, pos_x, labels[:, :, None]), dim=2)
         return pos
 
@@ -90,6 +102,8 @@ class PositionEmbeddingSine(nn.Module):
         cache_key = None
         cache_key = (x.shape[-2], x.shape[-1])
         if cache_key in self.cache:
+            # Cache Hit: Return the precomputed embedding for this resolution.
+            # This skips re-computation and maintains graph stability for torch.compile.
             return self.cache[cache_key][None].repeat(x.shape[0], 1, 1, 1)
         y_embed = (
             torch.arange(1, x.shape[-2] + 1, dtype=torch.float32, device=x.device)
@@ -120,5 +134,6 @@ class PositionEmbeddingSine(nn.Module):
         ).flatten(3)
         pos = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
         if cache_key is not None:
+            # Cache Update: Store the computed embedding for this resolution (H, W).
             self.cache[cache_key] = pos[0]
         return pos
