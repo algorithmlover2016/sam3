@@ -51,6 +51,70 @@ graph TD
     L2_Out --> FinalProj --> Output
 ```
 
+## Specific Instance Workflow (kernel=3, stride=2, padding=1, interpol_size=[1152, 1152])
+
+This chart visualizes the data flow for the instance:
+```python
+SimpleMaskDownSampler(
+    kernel_size=3, stride=2, padding=1, interpol_size=[1152, 1152]
+)
+```
+**Key Transformations:**
+- **Interpolation**: Input mask is resized to `(1152, 1152)`
+- **Layers**: `log2(16) / log2(2) = 4` layers.
+- **Channel Growth**: Powers of 2 (stride=2): $1 \rightarrow 4 \rightarrow 16 \rightarrow 64 \rightarrow 256$.
+- **Spatial Reduction**: Halved at each step: $1152 \rightarrow 576 \rightarrow 288 \rightarrow 144 \rightarrow 72$.
+
+```mermaid
+graph TD
+    %% Define Styles
+    classDef tensor fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
+    classDef op fill:#f3e5f5,stroke:#4a148c,stroke-width:2px;
+    classDef cond fill:#fff9c4,stroke:#fbc02d,stroke-width:2px;
+
+    %% Nodes
+    Input_Custom[("Input x<br/>(B, 1, H_in, W_in)")]:::tensor
+    Interp_Custom["F.interpolate<br/>to (1152, 1152)"]:::op
+    TensorIn_Custom[("Interpolated x<br/>(B, 1, 1152, 1152)")]:::tensor
+
+    subgraph Custom_Encoder_Loop [Encoder Loop - 4 Layers]
+        direction TB
+
+        %% Layer 1
+        CL1_Conv["Conv2d (k=3, s=2, p=1)<br/>Ch: 1 -> 4<br/>Size: 1152 -> 576"]:::op
+        CL1_NormAct["LayerNorm2d + GELU"]:::op
+        CL1_Out[("L1 Out<br/>(B, 4, 576, 576)")]:::tensor
+        
+        %% Layer 2
+        CL2_Conv["Conv2d (k=3, s=2, p=1)<br/>Ch: 4 -> 16<br/>Size: 576 -> 288"]:::op
+        CL2_NormAct["LayerNorm2d + GELU"]:::op
+        CL2_Out[("L2 Out<br/>(B, 16, 288, 288)")]:::tensor
+
+        %% Layer 3
+        CL3_Conv["Conv2d (k=3, s=2, p=1)<br/>Ch: 16 -> 64<br/>Size: 288 -> 144"]:::op
+        CL3_NormAct["LayerNorm2d + GELU"]:::op
+        CL3_Out[("L3 Out<br/>(B, 64, 144, 144)")]:::tensor
+
+        %% Layer 4
+        CL4_Conv["Conv2d (k=3, s=2, p=1)<br/>Ch: 64 -> 256<br/>Size: 144 -> 72"]:::op
+        CL4_NormAct["LayerNorm2d + GELU"]:::op
+        CL4_Out[("L4 Out<br/>(B, 256, 72, 72)")]:::tensor
+    end
+
+    FinalProj_Custom["Final Projection<br/>Conv2d (k=1, s=1)<br/>Ch: 256 -> 256"]:::op
+    Output_Custom[("Output<br/>(B, 256, 72, 72)")]:::tensor
+
+    %% Connections
+    Input_Custom --> Interp_Custom --> TensorIn_Custom
+    
+    TensorIn_Custom --> CL1_Conv --> CL1_NormAct --> CL1_Out
+    CL1_Out --> CL2_Conv --> CL2_NormAct --> CL2_Out
+    CL2_Out --> CL3_Conv --> CL3_NormAct --> CL3_Out
+    CL3_Out --> CL4_Conv --> CL4_NormAct --> CL4_Out
+    
+    CL4_Out --> FinalProj_Custom --> Output_Custom
+```
+
 ## Detailed Explanation of LayerNorm2d + GELU
 
 This combination is commonly used in Vision Transformers and modern ConvNets (like ConvNeXt) to process NCHW (Batch, Channels, Height, Width) data.
