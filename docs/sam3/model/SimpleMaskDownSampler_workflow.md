@@ -165,7 +165,7 @@ The activation function used is `nn.GELU`.
 *   **Formula**: $GELU(x) \approx 0.5 \cdot x \cdot (1 + \tanh(\sqrt{2/\pi} \cdot (x + 0.044715 \cdot x^3)))$
 *   **Effect**: Similar to ReLU but smoother (curved near 0, allows small negative gradients). It introduces non-linearity to the network, deciding which important features are preserved or enhanced.
 
-![ReLU vs GELU](activation_functions.svg)
+![ReLU vs GELU](../assets/activation_functions.svg)
 
 ### Combined Effect
 
