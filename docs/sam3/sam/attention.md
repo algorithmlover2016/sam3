@@ -101,8 +101,8 @@ Finally, the output is projected from the internal dimension back to the origina
 | Stage | Shape | Description |
 | :--- | :--- | :--- |
 | **Input** | $(B, N, D)$ | Raw Query input |
-| **Projected** | $(B, N, D_{int})$ | Project to internal dim ($D_{int} = D/R$) |
-| **Heads** | $(B, H, N, d_{head})$ | Split into $H$ heads ($d_{head} = D_{int}/H$) |
+| **Projected** | $(B, N, D_{int})$ | Project to internal dim ($D_{int} = D / R$) |
+| **Heads** | $(B, H, N, d_{head})$ | Split into $H$ heads ($d_{head} = D_{int} / H$) |
 | **Attention Out**| $(B, H, N, d_{head})$ | Contextualized vectors per head |
 | **Recombined** | $(B, N, D_{int})$ | Heads merged back |
 | **Final Output** | $(B, N, D)$ | Projected back to original embedding dim |
@@ -232,3 +232,157 @@ By explicitly setting all three flags to `True` before the function call, the co
 PyTorch's SDPA dispatcher automatically selects the most efficient kernel available for the given input shapes, data types, and GPU capabilities. Enabling all three serves as a "reset" or "safety net" to ensure that:
 *   The dispatcher isn't restricted by previous global settings in the codebase.
 *   It can gracefully degrade from Flash $\to$ MemEfficient $\to$ Math depending on what is supported for the specific tensor configuration at runtime.
+
+---
+
+# RoPEAttention Analysis
+
+`RoPEAttention` is a subclass of `Attention` that introduces **Rotary Position Embeddings (RoPE)**. It inherits the core projection and attention logic but injects positional information into the Queries ($q$) and Keys ($k$) before the attention computation.
+
+## Key Differences & Features
+
+1.  **Rotary Positional Encoding (RoPE)**:
+    It rotates the query and key vectors in a high-dimensional space to encode relative position information. This is standard in modern LLMs (like LLaMA) and Vision Transformers as it generalizes better to sequence lengths unseen during training.
+
+2.  **Frequency Calculation (`compute_cis`)**:
+    *   Frequencies are precomputed based on `feat_sizes` (spatial dimensions of the image feature map).
+    *   **Dynamic Update**: The `forward` method checks if the input spatial dimensions (`q.shape[-2]`) match the precomputed frequencies. If not (e.g., handling an image of a different size), it recalculates `self.freqs_cis` on the fly.
+    *   **Real vs. Complex**: Supports both complex number implementation (`torch.complex64`) and real number implementation (via `stack`). The code defaults to looking for complex, but has a `use_rope_real` flag.
+
+3.  **Cross-Attention Support (`rope_k_repeat`)**:
+    *   If `rope_k_repeat=True`, it allows the key's RoPE embedding to be repeated. This is crucial for cross-attention mechanisms (e.g., attending to a memory bank or a summarized prompt) where the Key sequence length might need to align with a broadcasting pattern.
+
+## Modified Data Flow
+
+The data flow is identical to the standard `Attention` class up to the **Head Separation** step. After separation, an additional step occurs:
+
+**RoPE Injection Step**:
+After `_separate_heads` creates $(B, H, N, d_{head})$, RoPE is applied:
+
+1.  **Reshape**: Treat the sequence length $N$ as a 2D spatial grid $(h, w)$. This assumes $N = h \times w$.
+2.  **Apply Rotation**:
+    *   $q' = \text{RoPE}(q, \text{freqs})$
+    *   $k' = \text{RoPE}(k, \text{freqs})$
+    *   Where $\text{freqs}$ encodes the $(x, y)$ coordinates in the image grid.
+
+$$
+\begin{aligned}
+\text{Attention Input} &: q', k', v \\
+\end{aligned}
+$$
+
+Note that **Values ($v$) are not rotated**, preserving the semantic content of the information being retrieved.
+
+## Parameter Count
+
+`RoPEAttention` introduces **zero additional trainable parameters** compared to the base `Attention` class. The positional encodings are fixed mathematical functions (sinusoids) determined by `rope_theta` and the input dimensions.
+
+## Updated Visual Workflow
+
+```mermaid
+graph TD
+    subgraph Inputs
+        Q(Query)
+        K(Key)
+        V(Value)
+    end
+
+    subgraph Projections
+        Q_proj[Linear]
+        K_proj[Linear]
+        V_proj[Linear]
+    end
+
+    subgraph RoPE_Processing [RoPE Injection]
+        Split[Separate Heads]
+        CalcHarmonics["Compute Freqs/Cis<br/>(Dynamic if size mismatch)"]
+        ApplyRoPE["Apply Rotary Embedding<br/>Rotate q and k"]
+    end
+
+    subgraph SDPA_Block
+        Attn["Attention<br/>Softmax(Q_rot K_rotᵀ / √d) V"]
+    end
+
+    subgraph Output
+        Merge[Recombine]
+        Out_proj[Linear]
+    end
+
+    Q --> Q_proj --> Split
+    K --> K_proj --> Split
+    V --> V_proj --> Split
+
+    Split -- q, k --> ApplyRoPE
+    CalcHarmonics -.-> ApplyRoPE
+    ApplyRoPE -- q_rot, k_rot --> Attn
+    Split -- v (unchanged) --> Attn
+
+    Attn --> Merge --> Out_proj
+```
+
+## Internal Mechanics: Position Embedding Logic
+
+This section breaks down exactly how the position embeddings are generated in `compute_axial_cis`.
+
+### Why "Axial"?
+Standard RoPE (like in LLaMA) treats the sequence as a 1D line ($0, 1, 2, \dots, N$). However, for images, structure is 2D (height $H$ and width $W$). `compute_axial_cis` separates the feature dimension into two halves:
+1.  **First Half ($d/2$)**: Encodes the **X-axis** position.
+2.  **Second Half ($d/2$)**: Encodes the **Y-axis** position.
+
+### Logic Breakdown (`compute_axial_cis`)
+
+The function generates "complex exponentials" (cis) which represent rotations ($e^{i \theta} = \cos \theta + i \sin \theta$).
+
+1.  **Frequency Generation**:
+    It generates base frequencies $\Theta = \{ \theta^{-2i/d} \}_{i=0}^{d/4}$ for one axis.
+    $$ \text{freqs} = \frac{1}{\theta^{2i/d}} $$
+    
+    > **Why `dim // 4`?**
+    > The code uses `torch.arange(0, dim, 4)[: (dim // 4)]`. This factor of 4 comes from two splits:
+    > 1.  **Axial Split**: `dim` is shared between X and Y axes $\to$ each axis gets `dim / 2`.
+    > 2.  **Complex Pairing**: RoPE requires pairing features ($x, y$) to form complex numbers for rotation $\to$ each axis needs `(dim / 2) / 2` = `dim / 4` frequency bands.
+
+2.  **Grid Generation (`init_t_xy`)**:
+    Creates a meshgrid of coordinates. `t_x` and `t_y` are 1D tensors of length $N = H \times W$, specifying the coordinates for every pixel/patch in the flattened sequence.
+    *   $t_x$: $[0, 1, 2, \dots, W-1, \dots]$ (Column indices)
+    *   $t_y$: $[0, 0, 0, \dots, 1, \dots]$ (Row indices)
+
+3.  **Outer Product (`torch.outer`)**:
+    The code performs `torch.outer(t, freqs)`.
+    *   **Input**: `t` is a position vector $(N)$. `freqs` is a frequency vector $(dim/4)$.
+    *   **Operation**: Calculates $t[i] \times freq[j]$ for all pairs $(i, j)$.
+    *   **Result**: A matrix of shape $(N, dim/4)$. Each row $i$ contains the rotation angles for token $i$ across all frequency bands.
+    *   **Meaning**: This computes $\theta \cdot \text{pos}$, which is the angle arguments for the sinusoid functions.
+
+    > **Example (H=W=64)**:
+    > Consider a $64 \times 64$ grid ($N=4096$) and 2 frequency bands $[f_1, f_2]$.
+    >
+    > **Coordinate Tensors (Flattened)**:
+    > *   $t_x$: $[0, 1, 2, \dots, 63, \quad 0, 1, 2, \dots, 63, \quad \dots]$ (Repeats 0-63 for every row)
+    > *   $t_y$: $[0, 0, \dots, 0, \quad 1, 1, \dots, 1, \quad \dots, \quad 63, 63, \dots, 63]$ (Repeats row index 64 times)
+    >
+    > **Calculation (Outer Product)**:
+    > For $t_x$ (Columns):
+    > $$
+    > \text{Outer}(t_x, [f_1, f_2]) =
+    > \begin{bmatrix}
+    > 0 \cdot f_1 & 0 \cdot f_2 \\
+    > 1 \cdot f_1 & 1 \cdot f_2 \\
+    > \vdots & \vdots \\
+    > 63 \cdot f_1 & 63 \cdot f_2 \\
+    > 0 \cdot f_1 & 0 \cdot f_2 \\
+    > \vdots & \vdots
+    > \end{bmatrix}
+    > $$
+    > This matrix ($4096 \times 2$) maps the column position of every pixel to its rotation angle at each frequency band.
+
+4.  **Polar Conversion**:
+    Convert angles to complex numbers on the unit circle:
+    *   $\text{cis}_x = 1 \cdot e^{i \cdot \text{angles}_x} = \cos(\text{angles}_x) + i \sin(\text{angles}_x)$
+    *   $\text{cis}_y = 1 \cdot e^{i \cdot \text{angles}_y} = \cos(\text{angles}_y) + i \sin(\text{angles}_y)$
+
+5.  **Concatenation**:
+    The final embedding is the concatenation of the X-axis embeddings and the Y-axis embeddings:
+    $$ \text{freqs\_cis} = [\text{cis}_x, \text{cis}_y] $$
+    
+    This results in a tensor of shape `(H, W, dim/2)` (complex numbers). When rotated, the first half of the feature vector "knows" the X-coordinate, and the second half "knows" the Y-coordinate.
