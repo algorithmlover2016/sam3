@@ -210,3 +210,25 @@ $$
 
 *   $4D^2$: Weights matrix contribution.
 *   $4D$: Bias vector contribution.
+
+## Attention Backend Mechanics
+
+The implementation contains specific configuration flags for the `scaled_dot_product_attention` (SDPA) kernel:
+
+```python
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_math_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+```
+
+By explicitly setting all three flags to `True` before the function call, the code **forces PyTorch's dispatcher to consider all available attention kernels**.
+
+1.  **`enable_flash_sdp(True)`**: Enables **Flash Attention** (v2). This is the fastest implementation but has strict hardware (A100, H100, RTX3090/4090, etc.) and shape alignment requirements.
+2.  **`enable_mem_efficient_sdp(True)`**: Enables **Memory-Efficient Attention** (based on xFormers). This serves as a robust fallback that is also memory-friendly but slightly slower than Flash Attention. It supports a wider range of hardware and input types.
+3.  **`enable_math_sdp(True)`**: Enables the **Math (C++) fallback**. This is the standard naive implementation of attention. It is the slowest and most memory-consuming ($O(N^2)$ memory) but guarantees compatibility if the optimized kernels fail due to hardware or shape constraints.
+
+**Why enable all three?**
+PyTorch's SDPA dispatcher automatically selects the most efficient kernel available for the given input shapes, data types, and GPU capabilities. Enabling all three serves as a "reset" or "safety net" to ensure that:
+*   The dispatcher isn't restricted by previous global settings in the codebase.
+*   It can gracefully degrade from Flash $\to$ MemEfficient $\to$ Math depending on what is supported for the specific tensor configuration at runtime.
