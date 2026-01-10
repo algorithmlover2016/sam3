@@ -341,11 +341,19 @@ The function generates "complex exponentials" (cis) which represent rotations ($
     > The code uses `torch.arange(0, dim, 4)[: (dim // 4)]`. This factor of 4 comes from two splits:
     > 1.  **Axial Split**: `dim` is shared between X and Y axes $\to$ each axis gets `dim / 2`.
     > 2.  **Complex Pairing**: RoPE requires pairing features ($x, y$) to form complex numbers for rotation $\to$ each axis needs `(dim / 2) / 2` = `dim / 4` frequency bands.
+    
+    **Shapes**:
+    *   `freqs_x`: `(dim // 4)`
+    *   `freqs_y`: `(dim // 4)`
 
 2.  **Grid Generation (`init_t_xy`)**:
     Creates a meshgrid of coordinates. `t_x` and `t_y` are 1D tensors of length $N = H \times W$, specifying the coordinates for every pixel/patch in the flattened sequence.
     *   $t_x$: $[0, 1, 2, \dots, W-1, \dots]$ (Column indices)
     *   $t_y$: $[0, 0, 0, \dots, 1, \dots]$ (Row indices)
+    
+    **Shapes**:
+    *   `t_x`: `(N)` (e.g. 4096)
+    *   `t_y`: `(N)`
 
 3.  **Outer Product (`torch.outer`)**:
     The code performs `torch.outer(t, freqs)`.
@@ -364,7 +372,7 @@ The function generates "complex exponentials" (cis) which represent rotations ($
     > **Calculation (Outer Product)**:
     > For $t_x$ (Columns):
     > $$
-    > \text{Outer}(t_x, [f_1, f_2]) =
+    > \text{Outer}(t_x, [f_1, f_2]) = 
     > \begin{bmatrix}
     > 0 \cdot f_1 & 0 \cdot f_2 \\
     > 1 \cdot f_1 & 1 \cdot f_2 \\
@@ -376,13 +384,39 @@ The function generates "complex exponentials" (cis) which represent rotations ($
     > $$
     > This matrix ($4096 \times 2$) maps the column position of every pixel to its rotation angle at each frequency band.
 
-4.  **Polar Conversion**:
-    Convert angles to complex numbers on the unit circle:
-    *   $\text{cis}_x = 1 \cdot e^{i \cdot \text{angles}_x} = \cos(\text{angles}_x) + i \sin(\text{angles}_x)$
-    *   $\text{cis}_y = 1 \cdot e^{i \cdot \text{angles}_y} = \cos(\text{angles}_y) + i \sin(\text{angles}_y)$
+4.  **Polar Conversion (`torch.polar`)**:
+    
+    ```python
+    freqs_cis_x = torch.polar(torch.ones_like(freqs_x), freqs_x)
+    ```
+
+    *   **Input**: `torch.polar(abs, angle)` constructs a complex number $z = \text{abs} \cdot e^{i \cdot \text{angle}}$.
+    *   **`abs` = 1**: The magnitude is set to 1 (`torch.ones_like`). The purpose of RoPE is **pure rotation** without scaling the vector's magnitude.
+    *   **`angle` = freqs_x**: The "outer product" matrix computed above contains the angles $\theta = t \cdot \text{base\_freq}$.
+    
+    The result is a matrix of complex numbers on the unit circle:
+    $$ z = \cos(\text{angle}) + i \sin(\text{angle}) $$
+    Multiplying the query/key vector by this $z$ performs the rotation.
+    
+    **Shapes**:
+    *   `freqs_cis_x`: `(N, dim // 4)` (Complex64)
+    *   `freqs_cis_y`: `(N, dim // 4)` (Complex64)
 
 5.  **Concatenation**:
-    The final embedding is the concatenation of the X-axis embeddings and the Y-axis embeddings:
-    $$ \text{freqs\_cis} = [\text{cis}_x, \text{cis}_y] $$
+    The final embedding combines X and Y embeddings:
+    ```python
+    torch.cat([freqs_cis_x, freqs_cis_y], dim=-1)
+    ```
     
-    This results in a tensor of shape `(H, W, dim/2)` (complex numbers). When rotated, the first half of the feature vector "knows" the X-coordinate, and the second half "knows" the Y-coordinate.
+    **Shapes**:
+    *   Input: Two matrices of size `(N, dim // 4)`.
+    *   Output: `(N, dim // 2)`.
+    *   Note: Since these are complex numbers, `dim // 2` complex elements correspond to `dim` float elements (Real/Imag pairs).
+    
+    > **Concatenation Example**:
+    > If a row in `freqs_cis_x` is `[x1, x2]` and a row in `freqs_cis_y` is `[y1, y_2]`.
+    > The concatenated row is `[x1, x2, y1, y2]`.
+    >
+    > This creates a structured embedding vector where:
+    > *   **First half** (`0` to `dim/2 - 1`): Encodes X-coordinates.
+    > *   **Second half** (`dim/2` to `dim`): Encodes Y-coordinates.
