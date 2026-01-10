@@ -420,3 +420,157 @@ The function generates "complex exponentials" (cis) which represent rotations ($
     > This creates a structured embedding vector where:
     > *   **First half** (`0` to `dim/2 - 1`): Encodes X-coordinates.
     > *   **Second half** (`dim/2` to `dim`): Encodes Y-coordinates.
+
+## Broadcasting Mechanics (`reshape_for_broadcast`)
+
+The helper function `reshape_for_broadcast` prepares the 2D frequency tensor `freqs_cis` to be element-wise multiplied with the 4D input tensors ($Q$, $K$).
+
+### Function Logic
+
+```python
+def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+    ndim = x.ndim                         # e.g., 4 for (B, H, N, D)
+    assert 0 <= 1 < ndim                  # Ensures rank is at least 2 (same as ndim > 1)
+    # Check that freqs_cis matches the last two dims of x
+    assert freqs_cis.shape == (x.shape[-2], x.shape[-1]) 
+    
+    # Create new shape list
+    shape = [d if i >= ndim - 2 else 1 for i, d in enumerate(x.shape)]
+    return freqs_cis.view(*shape)
+```
+
+1.  **`x.ndim`**: The rank (number of dimensions) of the input tensor `x`. Usually 4: $(B, H, N, D_{head})$.
+2.  **`assert 0 <= 1 < ndim`**: This is a slightly verbose way of ensuring `ndim > 1`.
+3.  **`shape` Construction**:
+    *   Iterates through all dimensions of `x`.
+    *   If the current dimension `i` is one of the last two (Sequence Length or Head Dim), keep the size `d`.
+    *   Otherwise (Batch or Head Count), set size to `1`.
+
+### Example Transformation
+
+*   **Input `x` Shape**: $(B, H, N, D_{head})$
+    *   $B$: Batch Size
+    *   $H$: Number of Heads
+    *   $N$: Sequence Length (4096)
+    *   $D_{head}$: Head Dimension (Complex, e.g., 32)
+*   **Input `freqs_cis` Shape**: $(N, D_{head})$
+    *   Shape: $(4096, 32)$
+
+**Operation**:
+The list comprehension generates: `[1, 1, N, D_{head}]`.
+The `view(*shape)` returns a 4D tensor: $(1, 1, 4096, 32)$.
+
+**Why?**
+This shape `(1, 1, N, D)` allows standard PyTorch broadcasting logic to apply the *same* rotation frequencies to:
+*   Every batch item (1st dim broadcast from 1 to B)
+*   Every attention head (2nd dim broadcast from 1 to H)
+
+## Apply Rotary Encoding (`apply_rotary_enc`)
+
+This function injects the positional information into the Queries and Keys using element-wise complex multiplication.
+
+### Logic Flow
+
+1.  **View as Complex**:
+    The input float tensors (Q, K) are reshaped to group pairs of values into complex numbers.
+    *   Input `xq`: $(B, H, N, D)$ (Float)
+    *   Reshape: `(B, H, N, D/2, 2)`
+    *   `view_as_complex`: Result `xq_` is $(B, H, N, D/2)$ (Complex64)
+
+2.  **Broadcast Preparation**:
+    The computed frequencies `freqs_cis` $(N, D/2)$ are reshaped to $(1, 1, N, D/2)$ using the broadcasting logic described above.
+
+3.  **Rotation (Multiplication)**:
+    Element-wise multiplication `*` rotates the vectors in the complex plane. This is **Hadamard product**, NOT matrix multiplication.
+    
+    *   $xq\_out = xq\_ * freqs\_cis$
+
+    For each element $x$ at $[b, h, n, d]$ and frequency $f$ at $[0, 0, n, d]$:
+    $$ x \cdot f = (a + ib)(\cos \theta + i \sin \theta) = (a \cos \theta - b \sin \theta) + i (a \sin \theta + b \cos \theta) $$
+    
+    This effectively rotates the vector $(a, b)$ by angle $\theta$.
+
+4.  **Repeat Frequencies (Optional)**:
+    If `repeat_freqs_k=True`, the function aligns the frequencies with a longer Key sequence.
+    *   **Assumption**: The Key sequence length ($M$) must be equal to or an integer multiple of the Query/Freq sequence length ($N$).
+    *   `r = xk_.shape[-2] // xq_.shape[-2]`
+    *   `freqs_cis.repeat(..., r, 1)`: The frequency tensor is tiled `r` times along the sequence dimension to match the Key tensor's size.
+    *   Practically, this implies $M \ge N$ and $M \% N == 0$. If $M < N$, this logic would fail (r=0).
+
+5.  **View as Real/Flatten**:
+    The rotated complex numbers are converted back to real pairs and flattened.
+    *   `view_as_real`: $(B, H, N, D/2, 2)$
+    *   `flatten(3)`: $(B, H, N, D)$
+
+### Visual Workflow
+
+```mermaid
+graph TD
+    subgraph Inputs
+        XQ(xq: Float<br/>B, H, N, D)
+        XK(xk: Float<br/>B, H, M, D)
+        FREQ(freqs_cis: Complex<br/>N, D/2)
+    end
+
+    subgraph Complex_Conversion [1. Complex Conversion]
+        XQ_C[xq_: Complex<br/>view_as_complex<br/>B, H, N, D/2]
+        XK_C[xk_: Complex<br/>view_as_complex<br/>B, H, M, D/2]
+    end
+
+    subgraph Broadcasting [2. Broadcast Prep]
+        FREQ_B[freqs_cis: Complex<br/>reshape_for_broadcast<br/>1, 1, N, D/2]
+    end
+    
+    subgraph Repetition [Optional: Repeat]
+        FREQ_R[freqs_cis_repeated<br/>repeat r times<br/>1, 1, M, D/2]
+    end
+
+    subgraph Rotation [3. Rotation]
+        XQ_ROT[xq_out: Complex<br/>xq_ * freqs_cis<br/>B, H, N, D/2]
+        XK_ROT[xk_out: Complex<br/>xk_ * freqs_cis_repeated<br/>B, H, M, D/2]
+    end
+
+    subgraph Output_Conversion [4. Real Conversion]
+        XQ_FINAL(xq_out: Float<br/>flatten<br/>B, H, N, D)
+        XK_FINAL(xk_out: Float<br/>flatten<br/>B, H, M, D)
+    end
+
+    XQ --> XQ_C
+    XK --> XK_C
+    FREQ --> FREQ_B
+    
+    XQ_C --> XQ_ROT
+    FREQ_B --> XQ_ROT
+    
+    XK_C --> XK_ROT
+
+    FREQ_B -- if repeat_freqs_k --> FREQ_R
+    FREQ_R --> XK_ROT
+    FREQ_B -. if not repeat -.-> XK_ROT
+
+    XQ_ROT --> XQ_FINAL
+    XK_ROT --> XK_FINAL
+```
+
+## Real vs. Complex Implementation (`use_rope_real`)
+
+The code provides two implementations for applying RoPE: `apply_rotary_enc` (using complex numbers) and `apply_rotary_enc_real` (using real numbers).
+
+**Mathematical Equivalence**:
+Yes, setting `use_rope_real` to either `True` or `False` generates the **same mathematical result**.
+
+1.  **Complex Path**:
+    Uses the complex multiplication property directly:
+    $$ (a+ib)(\cos\theta + i\sin\theta) = (a\cos\theta - b\sin\theta) + i(a\sin\theta + b\cos\theta) $$
+
+2.  **Real Path**:
+    Manually implements the real and imaginary components of the above formula:
+    *   `complex_mult` computes:
+        *   `real_part` = $xq_{\text{real}} * \cos\theta - xq_{\text{imag}} * \sin\theta$
+        *   `imag_part` = $xq_{\text{real}} * \sin\theta + xq_{\text{imag}} * \cos\theta$
+    
+    This manually implements the `2x2` rotation matrix multiplication for each pair of features.
+
+**Why have both?**
+*   **Hardware Compatibility**: Some edge devices (like certain mobile NPUs, TFLite delegates, or older GPU architectures) may not strictly support `Complex64` data types.
+*   **Optimization**: In some backends, avoiding complex number casting can be slightly faster or avoid certain overheads.
