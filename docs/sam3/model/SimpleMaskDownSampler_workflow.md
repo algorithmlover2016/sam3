@@ -165,7 +165,7 @@ The activation function used is `nn.GELU`.
 *   **Formula**: $GELU(x) \approx 0.5 \cdot x \cdot (1 + \tanh(\sqrt{2/\pi} \cdot (x + 0.044715 \cdot x^3)))$
 *   **Effect**: Similar to ReLU but smoother (curved near 0, allows small negative gradients). It introduces non-linearity to the network, deciding which important features are preserved or enhanced.
 
-![ReLU vs GELU](../assets/activation_functions.svg)
+![ReLU vs GELU vs GLU](../assets/activation_functions.svg)
 
 ### Combined Effect
 
@@ -173,3 +173,21 @@ In each step of the `SimpleMaskDownSampler`:
 1.  **Conv2d** extracts features and increases channel capacity.
 2.  **LayerNorm2d** "cleans" and standardizes each pixel vector, then applies a learned scale/shift.
 3.  **GELU** adds non-linearity.
+
+## Comparison of Activation Functions: ReLU vs GELU vs GLU
+
+| Feature | ReLU (Rectified Linear Unit) | GELU (Gaussian Error Linear Unit) | GLU (Gated Linear Unit) |
+| :--- | :--- | :--- | :--- |
+| **Formula** | $f(x) = \max(0, x)$ | $f(x) \approx 0.5x(1 + \tanh(\dots))$ | $f(a, b) = a \otimes \sigma(b)$ |
+| **Shape** | Piecewise linear, sharp corner at 0. Zero for all negative inputs. | Smooth curve, non-monotonic near 0. Allows small negative values. | Dynamic, depends on the gating input $b$. Smooth. |
+| **Properties** | Sparse activation (outputs exactly 0). Fast computation. | Probabilistic interpretation (expected drop-out). Differentiable everywhere. | Multiplicative gating explicitly models information flow control. |
+| **Cost** | Very Low | Low-Medium (involves tanh/erf) | Medium-High (Parameters doubled or dim halved) |
+| **Similarities** | All introduce non-linearity. All behave roughly linearly for large positive values. | | |
+| **Differences** | **Hard zero constraint**: ReLU kills negative gradients ("Dead ReLU"). | **Smoothness**: GELU has no sharp corner and preserves small negative info. | **Gating**: GLU uses a learnable gate ($\sigma$) to control signal flow, unlike static activations. |
+| **Best Use Case** | **CNNs, sparse data.** Standard default for efficiency. | **Transformers (BERT, ViT, GPT).** Standard for NLP and Vision Transformers where smoothness aids optimization. | **LLMs (PaLM, LLaMA), Sequence models.** Effective where conditional information flow is critical. |
+
+### When to use which?
+
+1.  **ReLU**: Use as a default for standard Convolutional Neural Networks (ResNet, VGG) or when computational efficiency/sparsity is paramount. Ideally paired with Batch Norm.
+2.  **GELU**: Preferred for **Transformers** and modern Architectures (ViT, ConvNeXt). The theoretical foundation (stochastic regularization) matches well with the attention mechanism and generally yields slightly better results than ReLU in these deep models.
+3.  **GLU**: Use in highly complex sequence modeling tasks or generic large language models (often as **SwiGLU** variants). It offers superior performance by allowing the network to explicitly learn which information to pass through, though at the cost of additional parameters or reduced dimension.
