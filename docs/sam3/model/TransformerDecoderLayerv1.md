@@ -69,7 +69,12 @@ This block allows queries to attend to each other.
     - Key ($K$): $X_{norm} + query\_pos$ (if `pos_enc_at_attn` is True, else $X_{norm}$)
     - Value ($V$): $X_{norm}$
 
-    > **Note on Q/K Identity**: In Self-Attention, the query and key inputs are often identical (same source `tgt` + `pos`). However, the `MultiheadAttention` module applies **different learnable linear projections** ($W_q$ vs $W_k$) to these inputs internally. Thus, the projected vectors used for the dot product $QK^T$ are effectively distinct.
+    > **Note on Q/K Identity**: The variables `q` and `k` passed here are the **Input Embeddings** (original token features + position encoding). They are *not* yet the projected Query/Key vectors used for dot-product attention.
+    > The `MultiheadAttention` module internally performs the projection:
+    > *   $\text{Internal } Q = \text{Input } q \times W_q$
+    > *   $\text{Internal } K = \text{Input } k \times W_k$
+    >
+    > Therefore, even though the **Input Embeddings** for `q` and `k` are the same tensor (`tgt + pos`), the **Internal Projected Vectors** are distinct due to independent weights ($W_q \neq W_k$).
 
 4.  **Attention**:
     $$ X_{attn} = \text{SelfAttention}(Q, K, V) $$
@@ -111,7 +116,9 @@ Standard MLP block processing each token independently.
 3.  **Residual & Dropout**:
     $$ tgt = tgt + \text{Dropout3}(X_{mlp}) $$
 
-## Visual Workflow
+## Visual Workflow (Pre-Norm Variant with DAC)
+
+This specific workflow illustrates the **Pre-Norm** architecture where `LayerNorm` is applied *before* the sub-layer operations (Attention/MLP). It also depicts the optional **DAC (Divide-and-Conquer)** strategy where self-attention is only applied to the first half of the queries.
 
 ```mermaid
 graph TD
@@ -122,63 +129,175 @@ graph TD
         MPos(Memory Pos)
     end
 
-    subgraph SelfAttentionBlock [Self Attention]
+    IsDAC{DAC Enabled?}
+
+    %% DAC Split Logic
+    Split["Split Queries<br/>Active: First N/2<br/>Passive: Last N/2"]
+    
+    %% Self Attention Block (Pre-Norm)
+    subgraph SelfAttentionBlock ["Self Attention Block (Pre-Norm)"]
+        direction TB
+        input_sa((Input))
         LN1[LayerNorm 1]
-        AddPosSA{Add Pos?}
+        AddPosSA[Add Q/K-Pos]
         SA[Self Attention]
         Drop1[Dropout]
-        Res1((Add))
+        Res1[Residual Add]
+        
+        input_sa --> Res1
+        input_sa --> LN1 --> AddPosSA
+        
+        AddPosSA -- Q, K --> SA
+        LN1 -- V --> SA
+        
+        SA --> Drop1 --> Res1
     end
+    
+    PassivePath(Passive Branch<br/>Identity)
 
-    subgraph CrossAttentionBlock [Cross Attention]
+    Recombine[Recombine / Concatenate]
+
+    %% Cross Attention Block (Pre-Norm)
+    subgraph CrossAttentionBlock ["Cross Attention Block (Pre-Norm)"]
+        direction TB
+        input_ca((Input))
         LN2[LayerNorm 2]
-        AddPosCA_Q{Add Q Pos?}
-        AddPosCA_K{Add K Pos?}
+        AddPosCA_Q[Add Q-Pos]
+        AddPosCA_K[Add K-Pos]
         CA[Cross Attention]
         Drop2[Dropout]
-        Res2((Add))
+        Res2[Residual Add]
+        
+        input_ca --> Res2
+        input_ca --> LN2 --> AddPosCA_Q -- Q --> CA
+        
+        Mem --> AddPosCA_K -- K --> CA
+        Mem -- V --> CA
+        MPos -.-> AddPosCA_K
+        
+        CA --> Drop2 --> Res2
     end
 
-    subgraph FFNBlock [Feed Forward]
+    %% FFN Block (Pre-Norm)
+    subgraph FFNBlock ["Feed Forward Block (Pre-Norm)"]
+        direction TB
+        input_ffn((Input))
         LN3[LayerNorm 3]
         Lin1[Linear 1]
         Act[Activation]
         Lin2[Linear 2]
         Drop3[Dropout]
-        Res3((Add))
+        Res3[Residual Add]
+        
+        input_ffn --> Res3
+        input_ffn --> LN3 --> Lin1 --> Act --> Drop3 --> Lin2 --> Res3
     end
 
-    %% Flow
-    Tgt --> Res1
-    Tgt --> LN1 --> AddPosSA
+    %% Connections
+    Tgt --> IsDAC
+    QPos -.-> AddPosSA
+    QPos -.-> AddPosCA_Q
+
+    %% Logic Flow
+    IsDAC -- No --> input_sa
+    IsDAC -- Yes --> Split
+    
+    Split -- Active Tgt --> input_sa
+    Split -- Passive Tgt --> Recombine
+
+    Res1 --> Recombine
+    
+    %% If DAC=No, Res1 goes straight to next stage.
+    %% Graphically we can merge the paths:
+    %% If DAC=No, Recombine is effectively Identity/Pass-through of the full tensor.
+    
+    Res1 -.-> IsDAC_Check{Path}
+    IsDAC_Check -- No DAC --> input_ca
+    Recombine -- With DAC --> input_ca
+
+    Res2 --> input_ffn
+    Res3 --> Output(Output<br/>N_q, B, D)
+```
+
+## Visual Workflow (Post-Norm Variant)
+
+This workflow illustrates the **Post-Norm** architecture where `LayerNorm` is applied *after* the residual addition of the sub-layer operations. Note that the **DAC** strategy is **not supported/used** in the Post-Norm implementation of this layer.
+
+```mermaid
+graph TD
+    subgraph Inputs
+        Tgt(Target / Queries<br/>N_q, B, D)
+        Mem(Memory / Image<br/>L, B, D)
+        QPos(Query Pos)
+        MPos(Memory Pos)
+    end
+
+    %% Self Attention Block (Post-Norm)
+    subgraph SelfAttentionBlock ["Self Attention Block (Post-Norm)"]
+        direction TB
+        input_sa((Input))
+        AddPosSA[Add Pos]
+        SA[Self Attention]
+        Drop1[Dropout]
+        Res1[Residual Add]
+        LN1[LayerNorm 1]
+        
+        input_sa --> Res1
+        input_sa --> AddPosSA
+        
+        AddPosSA -- Q, K --> SA
+        input_sa -- V --> SA
+        
+        SA --> Drop1 --> Res1
+        Res1 --> LN1
+    end
+
+    %% Cross Attention Block (Post-Norm)
+    subgraph CrossAttentionBlock ["Cross Attention Block (Post-Norm)"]
+        direction TB
+        input_ca((Input))
+        AddPosCA_Q[Add Q-Pos]
+        AddPosCA_K[Add K-Pos]
+        CA[Cross Attention]
+        Drop2[Dropout]
+        Res2[Residual Add]
+        LN2[LayerNorm 2]
+        
+        input_ca --> Res2
+        input_ca --> AddPosCA_Q -- Q --> CA
+        
+        Mem --> AddPosCA_K -- K --> CA
+        Mem -- V --> CA
+        MPos -.-> AddPosCA_K
+        QPos -.-> AddPosCA_Q
+        
+        CA --> Drop2 --> Res2
+        Res2 --> LN2
+    end
+
+    %% FFN Block (Post-Norm)
+    subgraph FFNBlock ["Feed Forward Block (Post-Norm)"]
+        direction TB
+        input_ffn((Input))
+        Lin1[Linear 1]
+        Act[Activation]
+        Lin2[Linear 2]
+        Drop3[Dropout]
+        Res3[Residual Add]
+        LN3[LayerNorm 3]
+        
+        input_ffn --> Res3
+        input_ffn --> Lin1 --> Act --> Drop3 --> Lin2 --> Res3
+        Res3 --> LN3
+    end
+
+    %% Connections
+    Tgt --> input_sa
     QPos -.-> AddPosSA
 
-    AddPosSA -- Q, K --> SA
-    LN1 -- V --> SA
-    
-    SA --> Drop1 --> Res1
-
-    %% Cross Attn
-    Res1 --> Res2
-    Res1 --> LN2
-    
-    LN2 --> AddPosCA_Q
-    QPos -.-> AddPosCA_Q
-    
-    Mem --> AddPosCA_K
-    MPos -.-> AddPosCA_K
-    
-    AddPosCA_Q -- Query --> CA
-    AddPosCA_K -- Key --> CA
-    Mem -- Value --> CA
-    
-    CA --> Drop2 --> Res2
-
-    %% FFN
-    Res2 --> Res3
-    Res2 --> LN3 --> Lin1 --> Act --> Drop3 --> Lin2 --> Res3
-    
-    Res3 --> Output(Output<br/>N_q, B, D)
+    LN1 --> input_ca
+    LN2 --> input_ffn
+    LN3 --> Output(Output<br/>N_q, B, D)
 ```
 
 ## Summary of Operations
